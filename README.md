@@ -456,3 +456,148 @@ shape-dependent kernel selection cuBLAS performs internally (as Boehm's
 kernel 9/10 discussion notes: cuBLAS ships hundreds of SGEMM kernel variants
 and dispatches by shape at runtime), and our data provides a concrete,
 independently-reproduced illustration of *why* that dispatch is necessary.
+
+---
+
+## Multi-architecture sweep: A100 (Ampere, sm_80)
+
+The full kernel progression (naive through warptiled) was re-run, unmodified,
+on an NVIDIA A100-SXM4-40GB via cross-compilation on node14 (see
+methodology note below) and execution on node10. All correctness checks
+(`C[0][0]`, `C[mid][mid]`, `C[last][last]`, checksum where applicable) match
+the L40S reference values exactly at every kernel and size tested.
+
+**A100 specs:** Compute capability 8.0, 108 SMs, 40GB HBM2e, 19.5 TFLOPS
+peak FP32, 40MB L2 cache, 2048 max threads/SM, 64 max warps/SM, 167936B
+shared mem/SM.
+
+### Methodology note: cross-compilation across nodes with mismatched toolchains
+
+Node10 (A100) has CUDA runtime libraries and a compatible driver
+(570.211.01, supporting up to CUDA 12.8) but **no CUDA compiler installed**
+— only `nvidia-smi` and runtime libraries, no `nvcc`. Node14 (L40S) has a
+full toolkit, but only version 13.1, which produces binaries requiring a
+newer driver than node10 has. A pip-based fix
+(`nvidia-cuda-nvcc-cu12`) was attempted but confirmed (via NVIDIA's own
+package documentation) to provide only the NVVM JIT backend library, not a
+standalone `nvcc` frontend executable — it cannot compile `.cu` files
+directly and was not a viable path.
+
+The actual fix: an older CUDA 12.4 toolkit install was found at
+`/home/u22/cuda-12.4` on node14 (alongside the default 13.1). Since
+`nvcc`'s device-code compilation targets a specific GPU architecture
+(`-arch=sm_80` for A100) independently of the host machine it runs on, and
+since node14 and node10 share a network home directory, binaries compiled
+on node14 with this older, driver-compatible toolkit run correctly on
+node10 without any files needing to be copied. This is a standard
+cross-compilation technique — `nvcc` emits GPU machine code as a pure data
+artifact; the compiling machine's own GPU (if any) is never involved in
+producing device code for a *different* target architecture. Compiling
+with a toolkit version too new for the target driver was the actual
+failure mode, not the cross-node approach itself, which worked immediately
+once the toolkit/driver version constraint was satisfied.
+
+### Full results comparison (L40S vs A100, % of each GPU's own peak FP32)
+
+| Kernel          | Size  | L40S GFLOPS | % L40S peak (91.6 TF) | A100 GFLOPS | % A100 peak (19.5 TF) |
+|-----------------|-------|-------------|------------------------|-------------|-------------------------|
+| Naive           | 1024³ | 618.16      | 0.7%                   | 214.38      | 1.1%                    |
+| Naive           | 4092³ | 2056.89     | 2.2%                   | 874.90      | 4.5%                    |
+| Naive           | 8192³ | 687.48      | 0.8%                   | 293.16      | 1.5%                    |
+| Coalesced       | 1024³ | 5028.50     | 5.5%                   | 3563.55     | 18.3%                   |
+| Coalesced       | 4092³ | 5249.52     | 5.7%                   | 3593.40     | 18.4%                   |
+| Shared-mem      | 1024³ | 6500.21     | 7.1%                   | 5196.12     | 26.6%                   |
+| Shared-mem      | 4096³ | 7220.58     | 7.9%                   | 5446.22     | 27.9%                   |
+| 1D blocktiled   | 4096³ | 18917.99    | 20.7%                  | 8918.65     | 45.7%                   |
+| 2D blocktiled   | 4096³ | 31987.02    | 34.9%                  | 11706.84    | 60.0%                   |
+| Best autotuned  | 2048³ | 35965.95    | 39.3%                  | 11274.25    | 57.8%                   |
+| Warptiled       | 2048³ | 37860.87    | 41.3%                  | 11545.02    | 59.2%                   |
+
+### Key finding: identical code reaches a much higher fraction of peak on A100 than L40S, consistently
+
+From kernel 2 onward, A100 runs at roughly **2.5-3x higher %-of-its-own-peak**
+than L40S for byte-for-byte identical kernel code. This holds at every
+optimization stage, not just the endpoint. The likely explanation: L40S's
+much larger raw FLOPS ceiling (91.6 vs 19.5 TFLOPS, a 4.7x difference) is
+proportionally harder to saturate with a fixed amount of parallelism and
+arithmetic intensity — the same kernel design that comfortably approaches
+A100's smaller ceiling leaves much more "room" unfilled on L40S. This
+reframes the earlier "L40S is 3.75x faster" headline: L40S has ~4.7x more
+raw silicon, and A100 is in fact extracting a *higher fraction* of what it
+has, not a lower one.
+
+### Key finding: naive kernel's peak-then-collapse pattern reproduces on a second architecture
+
+A100 shows the same qualitative shape as L40S: naive performance peaks at
+4092³ (874.90 GFLOPS) then collapses at 8192³ (293.16 GFLOPS) — this
+matches the pattern found on L40S almost exactly in shape, despite A100
+having a much smaller L2 cache (40MB vs L40S's 96MB). This strengthens the
+L2-masking hypothesis first proposed for L40S: even a comparatively modest
+40MB L2 is enough to produce non-monotonic naive-kernel scaling, not just
+unusually large caches. The specific matrix size where performance peaks
+appears to be a robust phenomenon across cache sizes, though direct `ncu`
+L2 hit-rate measurement is still needed to confirm the mechanism precisely
+rather than by pattern-matching alone.
+
+### Occupancy analysis on A100 (kernel 3) — a genuine architectural surprise
+
+Using the same manual method as L40S (`nvcc --ptxas-options=-v` +
+`cudaGetDeviceProperties`, since `ncu` remains unavailable on this cluster
+entirely):
+
+**Kernel 3 resource usage (sm_80):** 32 registers/thread (vs 36 on L40S's
+sm_89 — register allocation genuinely differs by architecture for identical
+source code), 8192B shared mem/block, 1024 threads/block.
+
+**A100 limits:** 2048 max threads/SM (vs L40S's 1536), 65536 max regs/SM
+(same as L40S), 167936B shared mem/SM (vs L40S's 102400B), 64 max
+warps/SM (vs L40S's 48), 108 SMs (vs L40S's 142).
+
+- Shared memory: 9216B/block effective → 167936/9216 = 18.2 → 18 blocks/SM upper limit
+- Threads: 1024/block, max 2048/SM → **2 blocks/SM** upper limit
+- Registers: 32×32=1024 regs/warp × 32 warps/block = 32768 regs/block → 65536/32768 = 2.0 → **2 blocks/SM** upper limit
+- **Binding constraint: threads & registers tie at 2 blocks/SM → occupancy = 64/64 warps = 100%**
+
+This is a striking contrast with L40S's result for the *same kernel*: L40S
+achieved only 66.7% theoretical occupancy (capped at 1 block/SM), while
+A100 achieves **100%** (2 blocks/SM) — because A100 allows double the
+threads/SM and substantially more shared memory/SM, so kernel 3's modest
+per-block footprint fits twice per SM on A100 but only once on L40S.
+
+**Yet A100 still produces lower absolute GFLOPS** (5196.12 vs 6500.21 at
+1024³) despite superior occupancy. This is an important, non-obvious
+result: **occupancy alone does not determine throughput** — A100's lower
+raw per-SM compute capability, different clock characteristics, and fewer
+total SMs (108 vs 142) dominate over its occupancy advantage for this
+kernel. This is a genuine caution against over-indexing on occupancy
+percentage as a proxy for performance, consistent with Boehm's own note
+(quoting Volkov's thesis) that high occupancy is not always necessary or
+sufficient for peak throughput, particularly outside the memory-bound
+regime.
+
+### Key finding: kernel 5 tile-size/SM cliff reproduces, but its recovery shape differs from L40S
+
+A100 has 108 SMs vs L40S's 142, changing the blocks-per-SM ratio at every
+matrix size (block count itself only depends on matrix/tile size, not
+architecture):
+
+| Size  | k5 blocks | Blocks/SM (A100) | Blocks/SM (L40S) | k5/k4 ratio (A100) | k5/k4 ratio (L40S) |
+|-------|-----------|-------------------|--------------------|----------------------|----------------------|
+| 1024³ | 64        | 0.59              | 0.45               | 0.964                | 0.94                 |
+| 1536³ | 144       | 1.33              | 1.01               | 1.086                | 1.22                 |
+| 2048³ | 256       | 2.37              | 1.80               | 1.457                | 1.77                 |
+| 4096³ | 1024      | 9.48              | 7.21               | 1.313                | 1.69                 |
+
+The cliff itself (ratio below 1.0 at 1024³) reproduces on both
+architectures, supporting the general tile-size/occupancy mechanism. However
+the *recovery* pattern does not scale simply with blocks-per-SM: at 1536³,
+A100 is already more oversubscribed than L40S was at the same size (1.33
+vs 1.01 blocks/SM) yet shows a *smaller* recovery ratio (1.086 vs 1.22x).
+This suggests block-count-vs-SM-count is not the complete explanation on
+A100 — other factors (A100's different per-SM compute throughput, HBM2e vs
+L40S's GDDR6 memory subsystem, or L2 size differences) likely interact with
+occupancy in ways not captured by the simple block-count model that fit
+L40S well. This nuance is reported honestly rather than forced into a
+clean unified story; resolving it further would require `ncu`-level warp
+stall and memory throughput data on both architectures, which remains
+blocked pending DCGM resolution.
