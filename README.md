@@ -683,3 +683,221 @@ lower ceiling (19.5 vs ~91 TFLOPS) is simply easier to fill with a fixed
 amount of arithmetic intensity and parallelism, while both Ada-generation
 cards need the full weight of blocktiling, vectorization, and warptiling to
 meaningfully close the gap to their much higher ceilings.
+
+---
+
+## Real ncu profiling data (finally unblocked via Colab, Tesla T4)
+
+After the DCGM lock made `ncu` unusable on Turing for the entire project,
+Google Colab's free tier (Tesla T4, Turing architecture, sm_75, CUDA 13.0,
+Nsight Compute 2025.1.1.0) provided working, unrestricted `ncu` access with
+no permission errors. Kernels 1-3 were cross-compiled for `sm_75` and
+profiled directly, finally replacing several inferred/hypothesized findings
+from earlier in this document with real measured data.
+
+**Note:** T4 is a fourth, distinct architecture (Turing) from the three
+main-line architectures (L40S, RTX 6000 Ada — both Ada Lovelace; A100 —
+Ampere) used for the primary kernel-progression comparison. Absolute GFLOPS
+numbers here are much lower (T4 is a lower-power inference-oriented card)
+and are not directly comparable to the main three-way table — this section
+exists purely to extract real hardware counter data unavailable elsewhere.
+
+| Metric | Kernel 1 (Naive) | Kernel 2 (Coalesced) | Kernel 3 (Shared-mem) |
+|---|---|---|---|
+| Sectors/request (global load) | 16.51 | 2.50 | 4.00 |
+| L1 hit rate | 99.23% | 94.93% | 1.52% |
+| L2 hit rate | 88.37% | 85.42% | 74.56% |
+| Shared-mem bank conflicts (LD) | 0 | 0 | 0 |
+| Shared-mem bank conflicts (ST) | 0 | 0 | 0 |
+| GFLOPS (T4, 1024³) | 9.75 | 14.62 | 14.92 |
+
+### Confirms Boehm's coalescing mechanism directly, with real numbers
+
+`l1tex__average_t_sectors_per_request` drops from **16.51 to 2.50**
+sectors/request (an 85% reduction) between the naive and coalesced kernels —
+this is a direct, measured confirmation of the exact mechanism Boehm
+describes: naive's scattered warp access pattern forces many separate 32B
+sector transactions per logical request, while the coalesced pattern
+consolidates them into far fewer. This was previously only theoretical
+here (assumed correct because it matched the source article's claims); it
+is now independently measured on real hardware.
+
+### Confirms the L2-masking hypothesis with real hardware counters, not pattern-matching
+
+Both naive and coalesced kernels show high L2 hit rates (88.37% and 85.42%
+respectively) even though T4's L2 cache is only **4MB** — smaller than the
+8MB combined working set of A and B at 1024×1024 fp32, which already
+exceeds L2 capacity. This is genuine, measured evidence that temporal
+locality from repeated row/column reuse across many threads sustains high
+L2 hit rates even when the raw dataset size exceeds the cache. This is the
+same mechanism separately hypothesized (from indirect performance-curve
+evidence alone) to explain L40S's non-monotonic naive-kernel scaling
+earlier in this document — now confirmed directly via hardware counters on
+an independent architecture, not just inferred from GFLOPS curves.
+
+### A genuinely counterintuitive finding: higher L1 hit rate does not mean better performance
+
+The naive kernel has a *higher* L1 hit rate (99.23%) than the coalesced
+kernel (94.93%) despite being dramatically slower (9.75 vs 14.62 GFLOPS).
+This is explainable: naive repeatedly re-reads the same row of A across many
+threads, creating high redundancy that L1 catches efficiently (a high hit
+rate on repeated, avoidable traffic) — while the coalesced kernel's access
+pattern already avoids much of that redundant traffic in the first place,
+leaving less for L1 to "hit" on. This is a useful, general caution: cache
+hit rate in isolation is not a reliable proxy for kernel quality without
+also considering *how much traffic reaches the cache in the first place*.
+
+### Shared memory introduces zero bank conflicts in kernel 3, by construction
+
+Kernel 3 shows 0 bank conflicts on both loads and stores. This is
+mechanistically correct, not a measurement gap: `Bs[dotIdx*BLOCKSIZE+
+threadCol]` gives each thread in a warp a distinct, consecutive bank
+(perfectly conflict-free), while `As[threadRow*BLOCKSIZE+dotIdx]` is
+identical across all threads in a warp at a given step — a **broadcast
+read**, a special hardware case that also produces zero conflicts (one
+transaction serves the whole warp). This confirms Boehm's later discussion
+of bank conflicts as a real bottleneck applies to the more complex
+register-tiled access patterns introduced in kernels 4 onward (where each
+thread reads a *range* of shared-memory addresses depending on its
+register-tile position), not to kernel 3's simpler tiling scheme — a
+distinction previously unconfirmed without direct profiling access.
+
+### A newly explained finding: L1 hit rate collapses once shared memory is introduced
+
+L1 hit rate drops sharply from kernel 2 (94.93%) to kernel 3 (1.52%). This
+is expected and not a sign of a problem: once data is staged through
+explicit shared memory, repeated reuse of global-memory values happens via
+SMEM rather than via L1 catching redundant GMEM reads — L1's
+redundancy-catching role is largely displaced by the programmer-managed
+SMEM cache, so naturally far less global-memory traffic passes through L1
+at all. L2 hit rate remains substantial (74.56%), continuing to support the
+broader L2-masking pattern seen throughout this project.
+
+### Bank conflicts confirmed: they appear exactly where Boehm's account predicts (kernel 6), not before
+
+Kernels 1-4 (naive through 1D blocktiling) all show **zero** shared-memory
+bank conflicts, and this was verified as mechanistically correct rather
+than a measurement gap: in each case, every warp's shared-memory access
+pattern reduces to either perfect coalescing (one bank per thread) or a
+broadcast read (identical address for every thread in the warp) — both
+hardware-supported conflict-free cases, given tile dimensions that are
+clean multiples of the 32-thread warp size.
+
+Kernel 6 (vectorized, transposed `As`, `float4` loads) is the first kernel
+in the entire progression to show non-zero bank conflicts:
+
+| Metric | Kernel 4 (1D blocktiled) | Kernel 6 (Vectorized) |
+|---|---|---|
+| Shared-mem bank conflicts (LD) | 0 | **4,194,304** |
+| Shared-mem bank conflicts (ST) | 0 | **262,144** |
+
+This is a direct, measured confirmation of Boehm's own account: he
+describes kernel 6 as introducing real bank conflicts specifically because
+of the transposed-`As` + vectorized-load restructuring, motivating his
+(unpublished, and per this project's own scoping decision, skipped)
+kernels 7-8 aimed at eliminating them. This is strong independent
+verification that the source article's narrative about *where* conflicts
+originate is accurate, obtained via direct hardware counters rather than
+by taking the claim on faith.
+
+**Caution on the sectors/request metric across load widths.** Kernel 6's
+`l1tex__average_t_sectors_per_request` (16.81) is numerically similar to
+the *naive* kernel's (16.51), which could misleadingly suggest kernel 6 has
+reverted to naive-level coalescing inefficiency. This is very unlikely to
+be a real regression: kernel 6 uses `float4` (16-byte) vectorized loads
+per thread instead of scalar 4-byte loads, so a single logical "request" in
+this metric now represents four times the data movement of kernels 1-5,
+making direct numerical comparison across differently-vectorized kernels
+unreliable. A rigorous apples-to-apples comparison would need a
+byte-normalized coalescing metric rather than this ratio directly; flagged
+here as a methodological caution rather than a performance finding, since
+resolving it precisely was outside this pass's scope.
+
+---
+
+## Non-square dimension sweep extended to all four architectures
+
+The same 4-shape non-square/non-power-of-two test (see earlier section) was
+re-run on A100 and RTX 6000 Ada via the same padding methodology, using the
+identical `torch.matmul` reference files generated once for L40S (fully
+deterministic given a fixed seed, so reused as-is across architectures).
+
+### Full 3-architecture comparison (GFLOPS)
+
+| Shape           | Blocks | L40S (142 SM) | A100 (108 SM) | RTX 6000 Ada (142 SM) |
+|-----------------|--------|----------------|-----------------|--------------------------|
+| 3000×1500×2048  | 288    | 27515.57       | 10613.21        | **30582.82**             |
+| 8192×256×1024   | 128    | 34083.58       | 7083.78         | **38043.57**             |
+| 2048×2048×2049  | 256    | 35932.00       | 9881.91         | **42540.81**             |
+| 137×263×401     | 6      | 623.98         | 218.59          | **625.24**               |
+
+All 12 architecture/shape combinations pass correctness against the same
+independent `torch.matmul` ground truth.
+
+### Key finding: small-matrix collapse severity is near-identical between the two Ada-class GPUs
+
+L40S and RTX 6000 Ada — near-identical silicon, confirmed earlier in this
+document — produce almost indistinguishable tiny-matrix performance
+(623.98 vs 625.24 GFLOPS), consistent with the occupancy-starvation
+mechanism being a property of the shared architecture (SM count, warp
+scheduler design) rather than a quirk of one specific chip.
+
+### Key finding: A100 collapses proportionally less than either Ada-class GPU
+
+Ratio of best large-shape performance to tiny-shape performance:
+- L40S: 35932/624 ≈ **57.6x**
+- RTX 6000 Ada: 42541/625 ≈ **68.1x**
+- A100: 9882/219 ≈ **45.1x**
+
+Despite having fewer SMs (108 vs 142) — which, naively, should make a
+fixed 6-block launch a *smaller* fraction of available SMs and thus a
+*worse* relative collapse — A100 in fact shows the mildest relative
+degradation of the three. This is consistent with the broader pattern
+found throughout this study: A100's much lower raw peak FLOPS ceiling
+means there is proportionally less headroom to leave unfilled at any
+occupancy level, making it inherently less sensitive to under-occupancy
+than the higher-ceiling Ada-class cards.
+
+## Real measured occupancy data confirms the small-matrix collapse mechanism (Colab T4)
+
+Using Colab's working `ncu` access, the tiny-matrix case (137×263×401, 6
+blocks) and a well-saturated large case (2048×2048×2049, 256 blocks) were
+directly profiled for **actual measured occupancy and SM throughput** —
+not the hand-derived theoretical occupancy used elsewhere in this document
+due to `ncu` being unavailable on the main Turing cluster architectures.
+
+| Metric (T4, sm_75) | Small (6 blocks) | Large (256 blocks) |
+|---|---|---|
+| Measured occupancy (`sm__warps_active`) | 24.93% | **47.30%** |
+| SM throughput (`sm__throughput`) | 10.75% | **60.88%** |
+| Shared-mem bank conflicts (LD) | 159,744 | 33,816,576 |
+
+This is the first *directly measured* (not inferred from block-count
+arithmetic) confirmation of the occupancy-starvation mechanism proposed
+throughout this study. Two results stand out:
+
+1. **Occupancy roughly doubles (24.93%→47.30%) while SM throughput
+   increases nearly 6x (10.75%→60.88%).** The throughput gap being much
+   larger than the occupancy gap indicates this kernel sits well below the
+   point of diminishing occupancy returns — small occupancy gains here
+   translate into disproportionately large real utilization gains, unlike
+   kernels already near the occupancy ceiling (where further gains yield
+   little additional throughput, per Boehm/Volkov's "cusp behavior"
+   discussion referenced earlier in kernel 3's analysis).
+
+2. **Bank conflicts scale slightly super-linearly with block count**: a
+   ~42.7x increase in blocks (6→256) produces a ~211x increase in total
+   conflicts (159,744→33,816,576). This is a secondary observation not
+   deeply investigated here, but worth flagging as a candidate follow-up:
+   whether per-block conflict *rate* also increases with more concurrent
+   blocks (e.g., through increased memory-system contention) or whether
+   this is simply proportional to total work done, would require further
+   per-block-normalized analysis.
+
+**Methodological note:** `ncu`'s instrumentation overhead reduced measured
+GFLOPS by roughly 1000x in these profiling runs (e.g., 204.30 GFLOPS
+unprofiled vs 0.16 GFLOPS profiled for the same small-matrix case). This is
+expected profiler overhead, not a real performance change — `ncu`-profiled
+GFLOPS figures should never be compared against normal (unprofiled) timing
+runs; only the hardware counter percentages/counts themselves are
+meaningful across profiling and non-profiling runs.
