@@ -168,3 +168,163 @@ continued steady progress, though the profiler-flagged remaining bottlenecks
 Boehm describes (shared-memory bank conflicts, un-tuned occupancy, no double
 buffering) are exactly where further gains would come from, matching his
 progression toward kernel autotuning next.
+
+---
+
+## Deep dive: A real bug found during autotuning, and why it almost went unnoticed
+
+This section documents the most significant methodological finding of the
+project — not because the bug itself was exotic, but because of *how close
+we came to missing it entirely*, and what that implies for correctness
+testing in performance-sensitive GPU code generally.
+
+### Background: why we needed tunable parameters
+
+Boehm's kernel 9 (autotuning) explains that the optimal `(BM, BN, BK, TM, TN)`
+tile parameters differ by GPU model, and that this is precisely why
+production libraries like cuBLAS and compilers like Triton perform
+autotuning rather than shipping one fixed configuration. To reproduce this
+on our hardware, we needed to make kernel 6's tile parameters overridable at
+compile time (`#ifndef BM / #define BM 128 / #endif`, etc., set via `nvcc -D`
+flags) and write a sweep script to compile and benchmark every valid
+combination.
+
+### The bug
+
+Kernel 6's GMEM→SMEM loading code, copied faithfully from Boehm's published
+article, does a **single-shot vectorized load per thread**:
+
+```cuda
+const uint innerRowA = threadIdx.x / (BK / 4);
+const uint innerColA = threadIdx.x % (BK / 4);
+// ... one float4 load per thread, no loop
+```
+
+This is only mathematically correct if `NUM_THREADS` exactly equals both
+`(BM*BK)/4` and `(BK*BN)/4` — i.e., the total thread count in the block
+exactly matches the number of float4 chunks needed to fill each shared
+memory tile in one pass. For Boehm's article parameters
+(`BM=BN=128, BK=8` → `NUM_THREADS=256`), this holds exactly:
+`128*8/4 = 256`. **The article's own code snippet is therefore only correct
+for the specific parameters it's demonstrated with — it does not generalize
+to arbitrary tile sizes**, something the article doesn't flag, likely
+because the autotuning section describes the *results* of a parameter sweep
+without publishing the (evidently more complex, generalized) sweep-capable
+kernel code itself.
+
+For any other parameter combination, the single-shot load either under-fills
+the SMEM tile (leaving stale/garbage values in unwritten rows) or, in the
+worst case, silently produces a kernel that satisfies all compile-time and
+launch-time checks while computing wrong results.
+
+### The false-positive trap: why `C[0][0]`-only correctness checking failed
+
+Our first-pass autotuning sweep checked correctness by comparing only
+`C[0][0]` against a known-good reference value. This caught **35 of 52**
+broken configurations — but incorrectly passed **17**, including at least
+one, `BM=256 BN=64 BK=16 TM=8 TN=8`, that we later proved was wrong for most
+of the output matrix.
+
+**Why did a broken kernel produce a correct `C[0][0]`?** Thread (0,0) only
+ever reads shared-memory rows within the range that happened to be correctly
+populated by the buggy single-shot load for that specific `(BM, BK)`
+combination — the corruption was confined to rows the corner element never
+touched. This is a textbook example of **an insufficient test oracle
+producing a false sense of correctness**: a single-point check can pass by
+coincidence whenever the bug's effect is spatially localized and the test
+point happens to sit outside the corrupted region.
+
+We caught this only because we deliberately paused to ask "are the passing
+configs actually correct, or only coincidentally correct?" rather than
+trusting the first sweep's results — a decision to independently re-derive,
+by hand, exactly which `(BM, BK, NUM_THREADS)` combinations satisfy the
+single-shot load's implicit exactness requirement, and check the "passing"
+results against that math rather than trusting the runtime check alone.
+That hand-derivation (checking `NUM_THREADS × 4 == BM×BK` as an *equality*,
+not just the weaker divisibility condition our first validity filter used)
+is what surfaced the coincidental pass.
+
+### The fix
+
+We rewrote the loading loop to be **strided and multi-pass**, matching the
+pattern already used in kernel 5's (non-vectorized) shared-memory loading,
+but preserving `float4` vectorization:
+
+```cuda
+const uint strideA = NUM_THREADS / (BK / 4);
+for (uint loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
+    float4 tmp = reinterpret_cast<const float4*>(&A[(innerRowA+loadOffset)*K + innerColA*4])[0];
+    As[(innerColA*4+0)*BM + innerRowA+loadOffset] = tmp.x;
+    // ... (y, z, w similarly)
+}
+```
+
+This generalizes correctly to any `(BM, BN, BK, NUM_THREADS)` combination
+satisfying the (now correctly derived) divisibility constraints, rather than
+requiring an exact one-to-one correspondence.
+
+### Stronger verification after the fix
+
+We also replaced the single-point correctness check with four independent
+checks per configuration: `C[0][0]` (top-left corner), `C[M/2][N/2]`
+(center), `C[M-1][N-1]` (bottom-right corner), and a full-matrix checksum
+(sum of all ~4.2M elements). A bug that corrupts any spatial region of the
+output is now overwhelmingly likely to be caught by at least one of these
+four checks, unlike the single-corner check that missed 17 broken configs.
+
+After the fix: **51 of 52 valid configurations passed all four correctness
+checks** (up from 17/52 pre-fix) — strong evidence the strided-load rewrite
+resolved the actual root cause rather than papering over one symptom.
+
+### A second, unrelated bug caught by the improved harness
+
+The one remaining "failure," `BM=256 BN=256 BK=16 TM=8 TN=8`, was not a
+correctness bug but a **silent launch failure**: this configuration compiles
+to 109 registers/thread (confirmed via `nvcc --ptxas-options=-v`), and at
+1024 threads/block that demands 111,616 registers — far exceeding the L40S's
+65,536 registers/block limit (from `cudaGetDeviceProperties`). CUDA's launch
+call fails silently by default (no exception, no crash — the kernel simply
+doesn't run), which our original harness didn't check for, so it recorded a
+near-zero elapsed time and computed a physically impossible ~11 million
+GFLOPS. Adding an explicit `cudaGetLastError()` check immediately after the
+timed launch loop converts this into a clear, correctly-attributed error:
+`too many resources requested for launch`. This is now a permanent part of
+the benchmarking harness for every kernel going forward, not just this one.
+
+### Note on methodology
+
+This entire investigation — identifying the root cause, deriving the exact
+mathematical condition the article's code silently assumes, designing the
+generalized fix, and building multi-point verification — was done through
+first-principles reasoning about the kernel's indexing arithmetic and
+GPU resource limits (via `nvcc --ptxas-options=-v` and
+`cudaGetDeviceProperties`), not by consulting external sources. Boehm's
+article does not publish the generalized/autotuning-capable kernel code, so
+no reference implementation was available to check against — the fix was
+derived and verified entirely from CUDA's execution model and the observed
+failure patterns.
+
+### Final autotuning results (L40S, 2048³, all correctness-verified)
+
+| Rank | BM  | BN  | BK | TM | TN | GFLOPS   |
+|------|-----|-----|----|----|----|----------|
+| 1    | 128 | 128 | 16 | 8  | 8  | 35965.95 |
+| 2    | 64  | 256 | 16 | 8  | 8  | 35915.90 |
+| 3    | 64  | 128 | 16 | 8  | 8  | 35894.29 |
+| 4    | 128 | 256 | 16 | 8  | 8  | 35326.73 |
+| 5    | 128 | 256 | 32 | 8  | 8  | 35226.36 |
+
+Every top-5 configuration uses `TM=TN=8` — the maximum register-blocking
+tested — regardless of `BM`/`BN`/`BK`, suggesting arithmetic intensity per
+thread remains the dominant lever even after tile-size/occupancy effects are
+accounted for. Our winning configuration (`BM=BN=128, BK=16, TM=TN=8`)
+**exactly matches** Boehm's own reported optimal parameters for the A6000
+(he found this combination gave a 5% improvement over the article's default
+`BK=8`, reaching 20 TFLOPS on his hardware). On the L40S, this configuration
+reaches 35965.95 GFLOPS — **39.3% of the L40S's 91.6 TFLOPS peak** FP32,
+compared to Boehm's ~20/38.7 ≈ 51.7% of the A6000's peak. This gap in
+relative efficiency, despite an identical "optimal" tile shape, is a
+concrete question for the multi-architecture sweep still to come — whether
+the L40S's much larger SM count (142 vs 84) changes what "optimal" actually
+means at this tile size, similar to the tile-size/occupancy cliff already
+found in kernel 5.
