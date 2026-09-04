@@ -772,3 +772,43 @@ redundancy-catching role is largely displaced by the programmer-managed
 SMEM cache, so naturally far less global-memory traffic passes through L1
 at all. L2 hit rate remains substantial (74.56%), continuing to support the
 broader L2-masking pattern seen throughout this project.
+
+### Bank conflicts confirmed: they appear exactly where Boehm's account predicts (kernel 6), not before
+
+Kernels 1-4 (naive through 1D blocktiling) all show **zero** shared-memory
+bank conflicts, and this was verified as mechanistically correct rather
+than a measurement gap: in each case, every warp's shared-memory access
+pattern reduces to either perfect coalescing (one bank per thread) or a
+broadcast read (identical address for every thread in the warp) — both
+hardware-supported conflict-free cases, given tile dimensions that are
+clean multiples of the 32-thread warp size.
+
+Kernel 6 (vectorized, transposed `As`, `float4` loads) is the first kernel
+in the entire progression to show non-zero bank conflicts:
+
+| Metric | Kernel 4 (1D blocktiled) | Kernel 6 (Vectorized) |
+|---|---|---|
+| Shared-mem bank conflicts (LD) | 0 | **4,194,304** |
+| Shared-mem bank conflicts (ST) | 0 | **262,144** |
+
+This is a direct, measured confirmation of Boehm's own account: he
+describes kernel 6 as introducing real bank conflicts specifically because
+of the transposed-`As` + vectorized-load restructuring, motivating his
+(unpublished, and per this project's own scoping decision, skipped)
+kernels 7-8 aimed at eliminating them. This is strong independent
+verification that the source article's narrative about *where* conflicts
+originate is accurate, obtained via direct hardware counters rather than
+by taking the claim on faith.
+
+**Caution on the sectors/request metric across load widths.** Kernel 6's
+`l1tex__average_t_sectors_per_request` (16.81) is numerically similar to
+the *naive* kernel's (16.51), which could misleadingly suggest kernel 6 has
+reverted to naive-level coalescing inefficiency. This is very unlikely to
+be a real regression: kernel 6 uses `float4` (16-byte) vectorized loads
+per thread instead of scalar 4-byte loads, so a single logical "request" in
+this metric now represents four times the data movement of kernels 1-5,
+making direct numerical comparison across differently-vectorized kernels
+unreliable. A rigorous apples-to-apples comparison would need a
+byte-normalized coalescing metric rather than this ratio directly; flagged
+here as a methodological caution rather than a performance finding, since
+resolving it precisely was outside this pass's scope.
