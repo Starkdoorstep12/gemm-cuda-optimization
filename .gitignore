@@ -7,4 +7,5 @@ __pycache__/
 *.pyc
 *.nsys-rep
 *.ncu-rep
+!profiling/reports/*.ncu-rep
 *.sqlite
