@@ -1,0 +1,10 @@
+gemm-env/
+kernels/01_naive
+kernels/02_coalescing
+kernels/*.o
+kernels/*_BROKEN*
+__pycache__/
+*.pyc
+*.nsys-rep
+*.ncu-rep
+*.sqlite
