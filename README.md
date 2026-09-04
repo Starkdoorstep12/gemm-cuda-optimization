@@ -952,3 +952,42 @@ principles — the remaining 7-16% gap likely requires substantially more
 specialized techniques (double buffering/software pipelining, tensor core
 utilization, or architecture-specific micro-tuning) beyond this study's
 scope.
+
+### T4 cuBLAS comparison — a much larger gap, with an important caveat
+
+| Size | GPU | GFLOPS |
+|------|-----|--------|
+| 1024³ | T4 | 2979.41 |
+| 1536³ | T4 | 3213.64 |
+| 2048³ | T4 | 3284.48 |
+| 4096³ | T4 | 4324.44 |
+
+Our kernel 6 (vectorized, default fixed parameters) on T4 achieved only
+15.44 GFLOPS at 1024³ — roughly **0.5% of cuBLAS's 2979.41 GFLOPS** at the
+same size, a dramatically larger gap than the 84-93% achieved on A100/RTX
+6000 Ada.
+
+**This gap should not be read as "our approach fails on Turing."** Two
+important differences from the A100/RTX 6000 Ada comparison make this an
+apples-to-oranges result rather than a genuine architecture-specific
+regression:
+
+1. **T4 only received the early/mid-pipeline kernel** (kernel 6, vectorized,
+   with default fixed parameters) for `ncu` profiling purposes — the full
+   warptiling and autotuning stages (which closed most of the gap to
+   cuBLAS on the two main-line architectures) were never run on T4, since
+   its role in this study was specifically to obtain hardware counter data
+   unavailable elsewhere, not to complete the full optimization pipeline.
+2. **cuBLAS on Turing likely uses fundamentally different compute
+   pathways** than on Ampere/Ada — Turing's Tensor Cores support mixed
+   precision paths, and NVIDIA's SGEMM library implementations for this
+   architecture generation may route through kernels our pure-FP32,
+   CUDA-core-only implementation was never designed to compete with
+   directly.
+
+A fair, like-for-like comparison would require running the full warptiling
+and autotuning pipeline on T4 specifically — not attempted here, since T4's
+role in this study was scoped to profiling rather than full optimization.
+This gap is reported transparently as a scope limitation rather than
+omitted, but should not be interpreted as evidence that the optimization
+techniques in this study are Turing-specific failures.
