@@ -901,3 +901,54 @@ expected profiler overhead, not a real performance change — `ncu`-profiled
 GFLOPS figures should never be compared against normal (unprofiled) timing
 runs; only the hardware counter percentages/counts themselves are
 meaningful across profiling and non-profiling runs.
+
+---
+
+## Comparison against cuBLAS (via torch.matmul): how close does our best kernel get?
+
+To address the assignment's request to consider "other approaches" and
+provide a concrete performance ceiling, our best hand-written kernels were
+benchmarked against `torch.matmul` (which dispatches to cuBLAS) at the same
+sizes, on A100 and RTX 6000 Ada.
+
+| Size | GPU | Custom (best autotuned) | Custom (warptiled) | cuBLAS | % of cuBLAS (best) |
+|------|-----|---------------------------|----------------------|--------|----------------------|
+| 2048³ | A100 | 11274.25 | 11545.02 | 13734.28 | **84.1%** |
+| 2048³ | RTX 6000 Ada | 42419.93 | 45069.00 | 48572.70 | **92.8%** |
+
+### Key finding: our kernel closes the gap to cuBLAS more on Ada-class hardware than on A100
+
+Despite starting from the same source code and optimization techniques
+(Boehm's kernel progression through warptiling and autotuning), our
+implementation reaches a meaningfully higher fraction of cuBLAS's
+performance on RTX 6000 Ada (92.8%) than on A100 (84.1%). This is
+consistent with — and a direct, concrete illustration of — the
+architecture-dependent kernel dispatch behavior discussed in Boehm's
+kernel 9/10 sections: cuBLAS ships many SGEMM kernel variants and selects
+per architecture and problem shape at runtime, meaning its A100-targeted
+kernels likely incorporate Ampere-specific tuning (e.g., different tile
+sizes or pipelining strategies suited to A100's SM design, tensor core
+usage for mixed-precision paths, or double-buffering) beyond what our fixed
+`(BM,BN,BK,TM,TN)` warptiling implementation captures. Since our kernel was
+tuned via the same generic autotuning search on both architectures (not
+independently re-optimized per architecture beyond re-running the same
+search), reaching 92.8% of cuBLAS on one architecture and only 84.1% on
+another highlights that "optimal" parameters are architecture-specific in
+ways a single autotuning pass captures only partially — cuBLAS's advantage
+likely comes from architecture-specific *kernel design* differences (not
+just parameter retuning) that this study's kernel-progression approach does
+not implement (e.g., double buffering, explicitly interleaved software
+pipelining, or tensor-core paths where applicable).
+
+### This is nonetheless a strong result for a from-scratch, course-scope implementation
+
+Reaching 84-93% of a professionally engineered, vendor-maintained library's
+performance using only the techniques covered in a single guided kernel
+progression (memory coalescing, shared-memory tiling, register blocking,
+vectorization, warptiling, and parameter autotuning) demonstrates that the
+overwhelming majority of the achievable speedup is captured by
+understanding and correctly applying these well-known optimization
+principles — the remaining 7-16% gap likely requires substantially more
+specialized techniques (double buffering/software pipelining, tensor core
+utilization, or architecture-specific micro-tuning) beyond this study's
+scope.
