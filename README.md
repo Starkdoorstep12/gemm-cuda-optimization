@@ -135,3 +135,36 @@ threshold itself (blocks ≈ SM count) is architecture-specific: it would occur
 at a different matrix size on a GPU with a different SM count (e.g. A100's
 108 SMs vs L40S's 142), which is a concrete, testable prediction for the
 multi-architecture sweep still to come.
+
+## Kernel 6: Vectorized SMEM/GMEM access (float4, transposed As)
+
+| Size  | k5 GFLOPS | k6 GFLOPS | k6/k5 ratio | % of peak (k6) |
+|-------|-----------|-----------|-------------|-----------------|
+| 1024³ | 15552.82  | 18593.32  | 1.20x       | 20.3%           |
+| 1536³ | 19048.18  | 23165.36  | 1.22x       | 25.3%           |
+| 2048³ | 30323.81  | 35220.36  | 1.16x       | 38.5%           |
+| 4096³ | 31987.02  | 36296.49  | 1.13x       | 39.6%           |
+
+Correctness verified: `C[0][0]` matches kernels 4/5 exactly at every size.
+
+Gains here (13-22%) are notably larger and more size-consistent than Boehm's
+reported ~3% SMEM-vectorization improvement — likely because we implemented
+both the SMEM transpose *and* GMEM float4 vectorization together, whereas he
+reports them as separate incremental steps.
+
+**Important confirming observation on the kernel 5 performance cliff:**
+Kernel 6 uses the identical BM=BN=128 tile size as kernel 5 (same block
+count at every matrix size), yet shows *no* dip below 1.0x speedup anywhere,
+including at 1024³ where kernel 5 itself underperformed kernel 4. This
+confirms the earlier cliff was specifically about the *k4-vs-k5 tile-size/
+block-count mismatch*, not something inherent to 128-sized tiles in general.
+Kernel 6 simply makes each of the same-sized, same-count blocks more
+memory-efficient via vectorized loads — an orthogonal axis to the occupancy
+issue identified in kernel 5, and evidence the two effects (tile-size-driven
+occupancy, and per-block memory-access efficiency) are cleanly separable.
+
+At 4096³, kernel 6 reaches 39.6% of the L40S's 91.6 TFLOPS peak FP32 —
+continued steady progress, though the profiler-flagged remaining bottlenecks
+Boehm describes (shared-memory bank conflicts, un-tuned occupancy, no double
+buffering) are exactly where further gains would come from, matching his
+progression toward kernel autotuning next.
