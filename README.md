@@ -991,3 +991,24 @@ role in this study was scoped to profiling rather than full optimization.
 This gap is reported transparently as a scope limitation rather than
 omitted, but should not be interpreted as evidence that the optimization
 techniques in this study are Turing-specific failures.
+
+### Full three-architecture cuBLAS comparison, and a consistency check
+
+| Size | GPU | Custom (best autotuned) | Custom (warptiled) | cuBLAS | % of cuBLAS (best) |
+|------|-----|---------------------------|----------------------|--------|----------------------|
+| 2048³ | L40S | 35965.95 | 37860.87 | 44340.41 | **85.4%** |
+| 2048³ | A100 | 11274.25 | 11545.02 | 13734.28 | **84.1%** |
+| 2048³ | RTX 6000 Ada | 42419.93 | 45069.00 | 48572.70 | **92.8%** |
+
+L40S and A100 land within 1.3 percentage points of each other (85.4% vs
+84.1%), while RTX 6000 Ada notably outperforms both (92.8%) — despite L40S
+and RTX 6000 Ada being near-identical silicon. This is fully consistent
+with, and independently reinforces from a different angle, the earlier
+finding that RTX 6000 Ada's ~11% higher memory bandwidth and different
+power/clock sustain profile specifically benefit the most
+bandwidth-intensive kernel stages (warptiling, heavily vectorized
+autotuned configs). The gap to cuBLAS is not a fixed property of "the
+architecture generation" (both are Ada Lovelace) but tracks the same
+real, measurable hardware difference (memory bandwidth/sustained clocks)
+identified earlier in the main kernel-progression comparison — a second,
+independent line of evidence for the same underlying mechanism.
