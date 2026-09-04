@@ -6,7 +6,7 @@ across multiple NVIDIA architectures.
 
 ## Hardware
 - RTX 6000 Ada (Turing cluster)
-- L40S (Turing cluster) — primary dev/test node so far, Ada Lovelace, sm_89, 142 SMs
+- L40S (Turing cluster) — primary dev/test node so far, Ada Lovelace, sm_89, 142 SMs, 91.6 TFLOPS peak FP32
 - A100 (Turing cluster)
 - (Targeting Colab T4/A100 as additional data points if cluster ncu access remains blocked)
 
@@ -14,7 +14,8 @@ across multiple NVIDIA architectures.
 - [x] Kernel 1: Naive
 - [x] Kernel 2: Global memory coalescing
 - [x] Kernel 3: Shared memory tiling
-- [ ] Kernel 4+: further optimizations (1D/2D blocktiling, vectorization, warptiling)
+- [x] Kernel 4: 1D blocktiling (multiple results per thread)
+- [ ] Kernel 5+: 2D blocktiling, vectorization, warptiling
 - [ ] Multi-architecture sweep
 - [ ] ncu deep profiling (blocked cluster-wide by DCGM; escalated to HPC admin; Colab fallback in progress)
 
@@ -24,25 +25,25 @@ Initial kernel 3 compiles defaulted to sm_75 (Turing) instead of the L40S's
 actual sm_89 (Ada Lovelace) — `nvcc` silently picked a fallback target since
 no `-arch` flag was passed. This changed the reported register count (41 vs
 36) though runtime performance was not meaningfully affected once corrected
-(<1.5% difference across all kernels/sizes re-tested). All kernels are now
-compiled with `-arch=sm_89`. This is flagged as a reproducibility lesson:
-always pass an explicit `-arch` matching the actual target GPU.
+(<1.5% difference across all kernels/sizes re-tested). All kernels from
+kernel 3 onward are compiled with `-arch=sm_89`.
 
 ## Results so far (L40S, sm_89)
 
-| Kernel            | Size  | GFLOPS  |
-|-------------------|-------|---------|
-| Naive             | 1024³ | 618.16  |
-| Naive             | 4092³ | 2056.89 |
-| Naive             | 8192³ | 687.48  |
-| Coalesced         | 1024³ | 5028.50 |
-| Coalesced         | 4092³ | 5249.52 |
-| Shared-mem tiled  | 1024³ | 6500.21 |
-| Shared-mem tiled  | 4096³ | 7220.58 |
+| Kernel            | Size  | GFLOPS   | % of 91.6 TFLOPS peak |
+|-------------------|-------|----------|------------------------|
+| Naive             | 1024³ | 618.16   | 0.7%                   |
+| Naive             | 4092³ | 2056.89  | 2.2%                   |
+| Naive             | 8192³ | 687.48   | 0.8%                   |
+| Coalesced         | 1024³ | 5028.50  | 5.5%                   |
+| Coalesced         | 4092³ | 5249.52  | 5.7%                   |
+| Shared-mem tiled  | 1024³ | 6500.21  | 7.1%                   |
+| Shared-mem tiled  | 4096³ | 7220.58  | 7.9%                   |
+| 1D blocktiled     | 1024³ | 16602.47 | 18.1%                  |
+| 1D blocktiled     | 4096³ | 18917.99 | 20.7%                  |
 
-Correctness verified: `C[0][0]` matches exactly across all three kernels at
-every tested size (same math, only access pattern / memory hierarchy usage
-differs).
+Correctness verified: `C[0][0]` matches exactly across all four kernels at
+every tested size.
 
 ## Key finding: naive kernel is non-monotonic in matrix size
 
@@ -61,36 +62,52 @@ available.
 | 1024³ | 8.13x                     |
 | 4092³ | 2.55x                     |
 
-Boehm reports a roughly fixed ~6.6x coalescing speedup (300 → 2000 GFLOPS).
-On this hardware, speedup varies substantially by matrix size — likely
-because at 4092³ the naive kernel is already partially "rescued" by L2 cache
-reuse (see above), leaving less headroom for coalescing to improve.
+Boehm reports a roughly fixed ~6.6x coalescing speedup. On this hardware,
+speedup varies substantially by matrix size — likely because at 4092³ the
+naive kernel is already partially "rescued" by L2 cache reuse, leaving less
+headroom for coalescing to improve.
 
 ## Key finding: shared-memory tiling gain, and occupancy analysis without ncu
 
 Shared-mem tiling gives ~29% improvement over coalesced at 1024³ and ~38% at
-~4096³ — smaller than Boehm's reported ~50%, plausibly because the coalesced
-baseline already benefits more from the larger L2 on this hardware, leaving
-less headroom (same pattern as the coalescing finding above).
+~4096³ — smaller than Boehm's reported ~50%, plausibly for the same L2-masking
+reason as above.
 
-With `ncu` blocked cluster-wide by DCGM, occupancy was instead derived by
-hand using `nvcc --ptxas-options=-v` (register/shared-mem usage) combined
-with `cudaGetDeviceProperties` (hardware limits), following the same manual
-method Boehm describes:
+With `ncu` blocked cluster-wide by DCGM, occupancy was derived by hand using
+`nvcc --ptxas-options=-v` (register/shared-mem usage) combined with
+`cudaGetDeviceProperties` (hardware limits):
 
 **Kernel 3 resource usage (sm_89):** 36 registers/thread, 8192B shared mem/block, 1024 threads/block
+**L40S limits:** 1536 max threads/SM, 65536 max regs/SM, 102400B shared mem/SM, 142 SMs, 48 max warps/SM
 
-**L40S hardware limits:** 1536 max threads/SM, 65536 max regs/SM, 102400B shared mem/SM, 142 SMs, 48 max warps/SM
-
-- Shared memory: (8192+1024)B/block → 102400/9216 = 11.1 → 11 blocks/SM upper limit
+- Shared memory: 9216B/block effective → 11 blocks/SM upper limit
 - Threads: 1024/block, max 1536/SM → 1 block/SM upper limit
-- Registers: 36×32=1152→1280 regs/warp (256-granularity rounding) × 32 warps/block = 40960 regs/block → 65536/40960 = 1.6 → 1 block/SM upper limit
-- **Binding constraint: threads & registers, 1 block/SM → occupancy = 32/48 = 66.7%**
+- Registers: 40960 regs/block → 1 block/SM upper limit
+- **Binding constraint: threads & registers → occupancy = 32/48 warps = 66.7%**
 
-This is numerically identical to Boehm's 66% result on the A6000. Since the
-limiting per-SM resource caps (max threads/SM, max regs/SM, warp size) are
-unchanged between Ampere and Ada for this kernel's resource footprint,
-per-SM occupancy is architecture-generation-independent here — all of the
-L40S's raw throughput advantage over Boehm's numbers comes from having 142
-SMs vs the A6000's 84 (1.7x more parallel occupancy-limited units), not from
-better per-SM utilization.
+Numerically identical to Boehm's 66% on the A6000 — the limiting per-SM
+resource caps are unchanged between Ampere and Ada for this kernel's
+footprint. All of the L40S's raw throughput advantage comes from having 142
+SMs vs the A6000's 84, not from better per-SM utilization.
+
+## Key finding: 1D blocktiling exceeds Boehm's reported improvement
+
+| Size  | Shared-mem → 1D blocktiled speedup |
+|-------|-------------------------------------|
+| 1024³ | 2.55x                                |
+| 4096³ | 2.62x                                |
+
+Boehm reports ~2.2x. This is the first kernel where our hardware *outperforms*
+his relative improvement, in contrast to kernels 2 and 3 where our gains were
+smaller than his. Plausible explanation: kernels 2 and 3 primarily address
+memory bandwidth/access-pattern problems that the L40S's much larger L2
+cache partially masks regardless of the fix, capping the visible improvement.
+Kernel 4's optimization instead raises arithmetic intensity (FLOPs per byte
+moved between GMEM/SMEM and registers) — a more fundamental fix that a larger
+cache cannot substitute for, so its full benefit shows through unmasked.
+
+This kernel also reaches 20.7% of the L40S's 91.6 TFLOPS peak FP32 throughput
+at 4096³, the largest jump in %-of-peak terms of any kernel transition so far
+(7.9% → 20.7%), consistent with arithmetic intensity being the dominant
+lever at this stage — matching Boehm's own framing that further gains should
+come from continuing to raise arithmetic intensity (kernel 5: 2D blocktiling).
