@@ -812,3 +812,92 @@ unreliable. A rigorous apples-to-apples comparison would need a
 byte-normalized coalescing metric rather than this ratio directly; flagged
 here as a methodological caution rather than a performance finding, since
 resolving it precisely was outside this pass's scope.
+
+---
+
+## Non-square dimension sweep extended to all four architectures
+
+The same 4-shape non-square/non-power-of-two test (see earlier section) was
+re-run on A100 and RTX 6000 Ada via the same padding methodology, using the
+identical `torch.matmul` reference files generated once for L40S (fully
+deterministic given a fixed seed, so reused as-is across architectures).
+
+### Full 3-architecture comparison (GFLOPS)
+
+| Shape           | Blocks | L40S (142 SM) | A100 (108 SM) | RTX 6000 Ada (142 SM) |
+|-----------------|--------|----------------|-----------------|--------------------------|
+| 3000×1500×2048  | 288    | 27515.57       | 10613.21        | **30582.82**             |
+| 8192×256×1024   | 128    | 34083.58       | 7083.78         | **38043.57**             |
+| 2048×2048×2049  | 256    | 35932.00       | 9881.91         | **42540.81**             |
+| 137×263×401     | 6      | 623.98         | 218.59          | **625.24**               |
+
+All 12 architecture/shape combinations pass correctness against the same
+independent `torch.matmul` ground truth.
+
+### Key finding: small-matrix collapse severity is near-identical between the two Ada-class GPUs
+
+L40S and RTX 6000 Ada — near-identical silicon, confirmed earlier in this
+document — produce almost indistinguishable tiny-matrix performance
+(623.98 vs 625.24 GFLOPS), consistent with the occupancy-starvation
+mechanism being a property of the shared architecture (SM count, warp
+scheduler design) rather than a quirk of one specific chip.
+
+### Key finding: A100 collapses proportionally less than either Ada-class GPU
+
+Ratio of best large-shape performance to tiny-shape performance:
+- L40S: 35932/624 ≈ **57.6x**
+- RTX 6000 Ada: 42541/625 ≈ **68.1x**
+- A100: 9882/219 ≈ **45.1x**
+
+Despite having fewer SMs (108 vs 142) — which, naively, should make a
+fixed 6-block launch a *smaller* fraction of available SMs and thus a
+*worse* relative collapse — A100 in fact shows the mildest relative
+degradation of the three. This is consistent with the broader pattern
+found throughout this study: A100's much lower raw peak FLOPS ceiling
+means there is proportionally less headroom to leave unfilled at any
+occupancy level, making it inherently less sensitive to under-occupancy
+than the higher-ceiling Ada-class cards.
+
+## Real measured occupancy data confirms the small-matrix collapse mechanism (Colab T4)
+
+Using Colab's working `ncu` access, the tiny-matrix case (137×263×401, 6
+blocks) and a well-saturated large case (2048×2048×2049, 256 blocks) were
+directly profiled for **actual measured occupancy and SM throughput** —
+not the hand-derived theoretical occupancy used elsewhere in this document
+due to `ncu` being unavailable on the main Turing cluster architectures.
+
+| Metric (T4, sm_75) | Small (6 blocks) | Large (256 blocks) |
+|---|---|---|
+| Measured occupancy (`sm__warps_active`) | 24.93% | **47.30%** |
+| SM throughput (`sm__throughput`) | 10.75% | **60.88%** |
+| Shared-mem bank conflicts (LD) | 159,744 | 33,816,576 |
+
+This is the first *directly measured* (not inferred from block-count
+arithmetic) confirmation of the occupancy-starvation mechanism proposed
+throughout this study. Two results stand out:
+
+1. **Occupancy roughly doubles (24.93%→47.30%) while SM throughput
+   increases nearly 6x (10.75%→60.88%).** The throughput gap being much
+   larger than the occupancy gap indicates this kernel sits well below the
+   point of diminishing occupancy returns — small occupancy gains here
+   translate into disproportionately large real utilization gains, unlike
+   kernels already near the occupancy ceiling (where further gains yield
+   little additional throughput, per Boehm/Volkov's "cusp behavior"
+   discussion referenced earlier in kernel 3's analysis).
+
+2. **Bank conflicts scale slightly super-linearly with block count**: a
+   ~42.7x increase in blocks (6→256) produces a ~211x increase in total
+   conflicts (159,744→33,816,576). This is a secondary observation not
+   deeply investigated here, but worth flagging as a candidate follow-up:
+   whether per-block conflict *rate* also increases with more concurrent
+   blocks (e.g., through increased memory-system contention) or whether
+   this is simply proportional to total work done, would require further
+   per-block-normalized analysis.
+
+**Methodological note:** `ncu`'s instrumentation overhead reduced measured
+GFLOPS by roughly 1000x in these profiling runs (e.g., 204.30 GFLOPS
+unprofiled vs 0.16 GFLOPS profiled for the same small-matrix case). This is
+expected profiler overhead, not a real performance change — `ncu`-profiled
+GFLOPS figures should never be compared against normal (unprofiled) timing
+runs; only the hardware counter percentages/counts themselves are
+meaningful across profiling and non-profiling runs.
