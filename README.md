@@ -601,3 +601,85 @@ L40S well. This nuance is reported honestly rather than forced into a
 clean unified story; resolving it further would require `ncu`-level warp
 stall and memory throughput data on both architectures, which remains
 blocked pending DCGM resolution.
+
+---
+
+## Multi-architecture sweep: RTX 6000 Ada (Ada Lovelace, sm_89)
+
+The full kernel progression was re-run natively on an RTX 6000 Ada
+Generation node (node03), which has a working `nvcc` directly (CUDA 12.9)
+— no cross-compilation needed for this architecture. All correctness
+checks pass exactly, matching L40S and A100 reference values at every
+kernel and size.
+
+**RTX 6000 Ada specs:** Ada Lovelace (AD102), 142 SMs, 18,176 CUDA cores,
+96MB L2, 48GB GDDR6, 91.1 TFLOPS peak FP32, 960 GB/s memory bandwidth,
+300W TDP — essentially identical silicon to the L40S (same core/SM count,
+same die, 91.6 TFLOPS peak, 864 GB/s bandwidth, 350W TDP), differing mainly
+in memory bandwidth (+11%) and TDP/form factor (workstation vs data-center
+card).
+
+### Three-way comparison (L40S vs RTX 6000 Ada vs A100)
+
+| Kernel          | Size  | L40S GFLOPS | %peak | RTX6000 GFLOPS | %peak | A100 GFLOPS | %peak |
+|-----------------|-------|-------------|-------|-----------------|-------|-------------|-------|
+| Naive           | 1024³ | 618.16      | 0.7%  | 613.28          | 0.7%  | 214.38      | 1.1%  |
+| Naive           | 4092³ | 2056.89     | 2.2%  | 2107.06         | 2.3%  | 874.90      | 4.5%  |
+| Naive           | 8192³ | 687.48      | 0.8%  | 740.68          | 0.8%  | 293.16      | 1.5%  |
+| Coalesced       | 1024³ | 5028.50     | 5.5%  | 5363.99         | 5.9%  | 3563.55     | 18.3% |
+| Coalesced       | 4092³ | 5249.52     | 5.7%  | 5084.32         | 5.6%  | 3593.40     | 18.4% |
+| Shared-mem      | 1024³ | 6500.21     | 7.1%  | 6995.17         | 7.7%  | 5196.12     | 26.6% |
+| Shared-mem      | 4096³ | 7220.58     | 7.9%  | 7371.63         | 8.1%  | 5446.22     | 27.9% |
+| 1D blocktiled   | 4096³ | 18917.99    | 20.7% | 18597.67        | 20.4% | 8918.65     | 45.7% |
+| 2D blocktiled   | 4096³ | 31987.02    | 34.9% | 30527.75        | 33.5% | 11706.84    | 60.0% |
+| Best autotuned  | 2048³ | 35965.95    | 39.3% | **42419.93**    | **46.6%** | 11274.25 | 57.8% |
+| Warptiled       | 2048³ | 37860.87    | 41.3% | **45069.00**    | **49.5%** | 11545.02 | 59.2% |
+
+### Key finding: near-identical silicon validates methodology through kernel 5
+
+Through kernels 1-5, L40S and RTX 6000 Ada track within ~5-10% of each
+other at every size — exactly what should be expected for functionally
+identical dies (same SM count, same CUDA core count, same L2 size, same
+peak FP32 spec within 0.5%). This is a valuable internal consistency check:
+it confirms the benchmarking methodology (timing harness, `-arch` targeting,
+correctness verification) produces coherent, architecture-appropriate
+results rather than noise, since two near-identical GPUs genuinely produce
+near-identical numbers where theory predicts they should.
+
+### Key finding: RTX 6000 Ada meaningfully outperforms L40S specifically at the most memory-bandwidth-sensitive kernels
+
+The close agreement breaks down exactly at kernels 6 (vectorized/autotuned)
+and 10 (warptiled) — the two stages most reliant on sustained shared-memory
+and register-file throughput under heavy vectorized traffic. RTX 6000 Ada
+leads by **+18% (42419.93 vs 35965.95)** on the best autotuned config and
+**+19% (45069.00 vs 37860.87)** on warptiling, despite both cards sharing
+peak FP32 specs within 0.5% of each other.
+
+The most likely explanation is RTX 6000 Ada's **11% higher rated memory
+bandwidth** (960 vs 864 GB/s) combined with its lower TDP (300W vs 350W)
+suggesting a different power/clock profile — a workstation card in a
+single-GPU desktop chassis may sustain boost clocks more consistently under
+load than a passively-cooled data-center card designed for dense multi-GPU
+rack deployment, even at a lower rated TDP. This would explain why the gap
+appears specifically once kernels become bandwidth/throughput-bound in
+their working-set access pattern (heavy `float4` vectorized loads, tight
+register/shared-memory interplay) rather than at earlier, less
+bandwidth-intensive stages, where compute latency dominates instead and the
+nearly-identical peak FP32 numbers govern performance almost equally.
+Confirming this precisely would require direct clock/power monitoring
+during the kernel (via `nvidia-smi -q -d CLOCK,POWER` sampled during
+execution) or `ncu`'s SM clock/throughput counters — both left as follow-up
+work given the ongoing DCGM profiling block.
+
+### A100 remains the clear outlier, and its relative strength grows with optimization
+
+Consistent with the earlier A100-vs-L40S finding, A100 shows the largest
+%-of-own-peak figures throughout, and this gap *widens* as kernels become
+more sophisticated: 18.3% (coalesced) → 26.6% (shared-mem) → 45.7% (1D
+blocktiled) → 57.8-60.0% (best/warptiled). This reinforces the earlier
+hypothesis that a GPU's *raw peak FLOPS headroom* is inversely related to
+how easily naive-to-intermediate kernel designs can approach it: A100's far
+lower ceiling (19.5 vs ~91 TFLOPS) is simply easier to fill with a fixed
+amount of arithmetic intensity and parallelism, while both Ada-generation
+cards need the full weight of blocktiling, vectorization, and warptiling to
+meaningfully close the gap to their much higher ceilings.
