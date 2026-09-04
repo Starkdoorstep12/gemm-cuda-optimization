@@ -683,3 +683,92 @@ lower ceiling (19.5 vs ~91 TFLOPS) is simply easier to fill with a fixed
 amount of arithmetic intensity and parallelism, while both Ada-generation
 cards need the full weight of blocktiling, vectorization, and warptiling to
 meaningfully close the gap to their much higher ceilings.
+
+---
+
+## Real ncu profiling data (finally unblocked via Colab, Tesla T4)
+
+After the DCGM lock made `ncu` unusable on Turing for the entire project,
+Google Colab's free tier (Tesla T4, Turing architecture, sm_75, CUDA 13.0,
+Nsight Compute 2025.1.1.0) provided working, unrestricted `ncu` access with
+no permission errors. Kernels 1-3 were cross-compiled for `sm_75` and
+profiled directly, finally replacing several inferred/hypothesized findings
+from earlier in this document with real measured data.
+
+**Note:** T4 is a fourth, distinct architecture (Turing) from the three
+main-line architectures (L40S, RTX 6000 Ada — both Ada Lovelace; A100 —
+Ampere) used for the primary kernel-progression comparison. Absolute GFLOPS
+numbers here are much lower (T4 is a lower-power inference-oriented card)
+and are not directly comparable to the main three-way table — this section
+exists purely to extract real hardware counter data unavailable elsewhere.
+
+| Metric | Kernel 1 (Naive) | Kernel 2 (Coalesced) | Kernel 3 (Shared-mem) |
+|---|---|---|---|
+| Sectors/request (global load) | 16.51 | 2.50 | 4.00 |
+| L1 hit rate | 99.23% | 94.93% | 1.52% |
+| L2 hit rate | 88.37% | 85.42% | 74.56% |
+| Shared-mem bank conflicts (LD) | 0 | 0 | 0 |
+| Shared-mem bank conflicts (ST) | 0 | 0 | 0 |
+| GFLOPS (T4, 1024³) | 9.75 | 14.62 | 14.92 |
+
+### Confirms Boehm's coalescing mechanism directly, with real numbers
+
+`l1tex__average_t_sectors_per_request` drops from **16.51 to 2.50**
+sectors/request (an 85% reduction) between the naive and coalesced kernels —
+this is a direct, measured confirmation of the exact mechanism Boehm
+describes: naive's scattered warp access pattern forces many separate 32B
+sector transactions per logical request, while the coalesced pattern
+consolidates them into far fewer. This was previously only theoretical
+here (assumed correct because it matched the source article's claims); it
+is now independently measured on real hardware.
+
+### Confirms the L2-masking hypothesis with real hardware counters, not pattern-matching
+
+Both naive and coalesced kernels show high L2 hit rates (88.37% and 85.42%
+respectively) even though T4's L2 cache is only **4MB** — smaller than the
+8MB combined working set of A and B at 1024×1024 fp32, which already
+exceeds L2 capacity. This is genuine, measured evidence that temporal
+locality from repeated row/column reuse across many threads sustains high
+L2 hit rates even when the raw dataset size exceeds the cache. This is the
+same mechanism separately hypothesized (from indirect performance-curve
+evidence alone) to explain L40S's non-monotonic naive-kernel scaling
+earlier in this document — now confirmed directly via hardware counters on
+an independent architecture, not just inferred from GFLOPS curves.
+
+### A genuinely counterintuitive finding: higher L1 hit rate does not mean better performance
+
+The naive kernel has a *higher* L1 hit rate (99.23%) than the coalesced
+kernel (94.93%) despite being dramatically slower (9.75 vs 14.62 GFLOPS).
+This is explainable: naive repeatedly re-reads the same row of A across many
+threads, creating high redundancy that L1 catches efficiently (a high hit
+rate on repeated, avoidable traffic) — while the coalesced kernel's access
+pattern already avoids much of that redundant traffic in the first place,
+leaving less for L1 to "hit" on. This is a useful, general caution: cache
+hit rate in isolation is not a reliable proxy for kernel quality without
+also considering *how much traffic reaches the cache in the first place*.
+
+### Shared memory introduces zero bank conflicts in kernel 3, by construction
+
+Kernel 3 shows 0 bank conflicts on both loads and stores. This is
+mechanistically correct, not a measurement gap: `Bs[dotIdx*BLOCKSIZE+
+threadCol]` gives each thread in a warp a distinct, consecutive bank
+(perfectly conflict-free), while `As[threadRow*BLOCKSIZE+dotIdx]` is
+identical across all threads in a warp at a given step — a **broadcast
+read**, a special hardware case that also produces zero conflicts (one
+transaction serves the whole warp). This confirms Boehm's later discussion
+of bank conflicts as a real bottleneck applies to the more complex
+register-tiled access patterns introduced in kernels 4 onward (where each
+thread reads a *range* of shared-memory addresses depending on its
+register-tile position), not to kernel 3's simpler tiling scheme — a
+distinction previously unconfirmed without direct profiling access.
+
+### A newly explained finding: L1 hit rate collapses once shared memory is introduced
+
+L1 hit rate drops sharply from kernel 2 (94.93%) to kernel 3 (1.52%). This
+is expected and not a sign of a problem: once data is staged through
+explicit shared memory, repeated reuse of global-memory values happens via
+SMEM rather than via L1 catching redundant GMEM reads — L1's
+redundancy-catching role is largely displaced by the programmer-managed
+SMEM cache, so naturally far less global-memory traffic passes through L1
+at all. L2 hit rate remains substantial (74.56%), continuing to support the
+broader L2-masking pattern seen throughout this project.
