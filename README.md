@@ -8,7 +8,7 @@ across multiple NVIDIA architectures.
 - RTX 6000 Ada (Turing cluster)
 - L40S (Turing cluster) — primary dev/test node so far, Ada Lovelace, sm_89, 142 SMs, 91.6 TFLOPS peak FP32
 - A100 (Turing cluster)
-- (Targeting Colab T4/A100 as additional data points if cluster ncu access remains blocked)
+- (Targeting Colab as an additional data point if cluster ncu access remains blocked)
 
 ## Status
 - [x] Kernel 1: Naive
@@ -16,9 +16,28 @@ across multiple NVIDIA architectures.
 - [x] Kernel 3: Shared memory tiling
 - [x] Kernel 4: 1D blocktiling
 - [x] Kernel 5: 2D blocktiling
-- [ ] Kernel 6: vectorized/transposed loads
-- [ ] Multi-architecture sweep
+- [x] Kernel 6: Vectorized SMEM/GMEM access (float4)
+- [x] Kernels 7-8: Skipped — see note below
+- [x] Kernel 9: Autotuning (found and fixed a real correctness bug along the way)
+- [x] Kernel 10: Warptiling
+- [x] Non-square / non-power-of-two dimension testing
+- [ ] Multi-architecture sweep (RTX 6000 Ada, A100)
 - [ ] ncu deep profiling (blocked cluster-wide by DCGM; escalated to HPC admin; Colab fallback in progress)
+- [ ] Plots / visualizations
+- [ ] Final report writeup
+
+## Note: kernels 7 and 8 skipped
+
+Boehm's article itself skips kernels 7 and 8 in the published writeup — he
+describes them as experiments in eliminating shared-memory bank conflicts
+that ended up being net-negative for performance on his hardware, and does
+not publish their code. We follow the same choice: kernels 7-8 are omitted
+from this study, consistent with the source article's own finding that they
+were not beneficial. Bank-conflict elimination remains a documented,
+identified-but-unpursued optimization opportunity (see kernel 6 discussion),
+and is a candidate for a stretch-goal appendix if time permits after the
+core assignment requirements (multi-architecture sweep, dimension testing,
+plots, profiling) are complete.
 
 ## Methodology note: always target the correct -arch
 
@@ -46,9 +65,18 @@ All kernels from kernel 3 onward compiled with `-arch=sm_89`.
 | 2D blocktiled     | 1536³ | 19048.18 | 20.8%                  |
 | 2D blocktiled     | 2048³ | 30323.81 | 33.1%                  |
 | 2D blocktiled     | 4096³ | 31987.02 | 34.9%                  |
+| Vectorized (k6)   | 1024³ | 18593.32 | 20.3%                  |
+| Vectorized (k6)   | 1536³ | 23165.36 | 25.3%                  |
+| Vectorized (k6)   | 2048³ | 35220.36 | 38.5%                  |
+| Vectorized (k6)   | 4096³ | 36296.49 | 39.6%                  |
+| Best autotuned    | 2048³ | 35965.95 | 39.3%                  |
+| Warptiled (k10)   | 2048³ | 37860.87 | 41.3%                  |
 
-Correctness verified: `C[0][0]` matches exactly across all five kernels at
-every tested size.
+Correctness verified via multiple independent methods across kernels: exact
+`C[0][0]` matching through kernel 6, multi-point checks (corner/center/
+opposite-corner/full-matrix checksum) from kernel 6's autotuning fix onward,
+and independent `torch.matmul` ground-truth comparison for the non-square
+dimension testing.
 
 ## Key finding: naive kernel is non-monotonic in matrix size
 
@@ -288,8 +316,9 @@ doesn't run), which our original harness didn't check for, so it recorded a
 near-zero elapsed time and computed a physically impossible ~11 million
 GFLOPS. Adding an explicit `cudaGetLastError()` check immediately after the
 timed launch loop converts this into a clear, correctly-attributed error:
-`too many resources requested for launch`. This is now a permanent part of
-the benchmarking harness for every kernel going forward, not just this one.
+`too many resources requested for launch`. This check was subsequently built
+into every later kernel's benchmarking harness (kernel 10 onward) from the
+start, rather than discovered after the fact again.
 
 ### Note on methodology
 
@@ -328,6 +357,45 @@ concrete question for the multi-architecture sweep still to come — whether
 the L40S's much larger SM count (142 vs 84) changes what "optimal" actually
 means at this tile size, similar to the tile-size/occupancy cliff already
 found in kernel 5.
+
+---
+
+## Kernel 10: Warptiling
+
+Boehm's final kernel adds a third tiling hierarchy — warp-level tiling —
+between the existing block-level and thread-level tiling. This makes all
+three levels of GPU parallelism explicit in the code: blocktiling (different
+SMs), warptiling (different warp schedulers within an SM), and threadtiling
+(instruction-level parallelism within a thread). The full kernel (not fully
+published in Boehm's article, which shows only the inner loop) was
+reconstructed from first principles based on the article's description and
+the documented parameter relationships (`WMITER`, `WSUBM`, `WSUBN`, warp/
+thread placement within warp subtiles).
+
+Given the lesson learned from the kernel 6 autotuning bug, this kernel's
+correctness harness was built with multi-point checks (`C[0][0]`,
+`C[mid][mid]`, `C[last][last]`, full-matrix checksum) and an explicit
+`cudaGetLastError()` safety check **from the start**, rather than added
+after a bug was found. Using Boehm's standard warptiling configuration
+(`BM=BN=128, BK=16, WM=WN=64, WNITER=4, TM=8, TN=4, NUM_THREADS=128`), all
+four correctness checks passed exactly against the kernel 6 reference values
+on the first attempt.
+
+**Results at 2048³ (L40S, sm_89):**
+
+| Kernel                              | GFLOPS   | % of 91.6 TFLOPS peak |
+|--------------------------------------|----------|------------------------|
+| Vectorized (k6, default params)      | 35220.36 | 38.5%                  |
+| Best autotuned (BM=BN=128,BK=16,TM=TN=8) | 35965.95 | 39.3%              |
+| **Warptiled (k10)**                  | **37860.87** | **41.3%**          |
+
+Warptiling beats even the best autotuned non-warptiled configuration by
+**~5.3%** — a smaller relative gain than Boehm's reported ~10% improvement
+on the A100 (19.7→21.7 TFLOPS), but a clear, correctness-verified
+improvement nonetheless. This completes the full main-line kernel
+progression from Boehm's article (kernels 1 through 6, 9, and 10; kernels
+7-8 explicitly skipped per the source article's own finding, see note at
+top of this document).
 
 ---
 
