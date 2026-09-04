@@ -328,3 +328,63 @@ concrete question for the multi-architecture sweep still to come — whether
 the L40S's much larger SM count (142 vs 84) changes what "optimal" actually
 means at this tile size, similar to the tile-size/occupancy cliff already
 found in kernel 5.
+
+---
+
+## Non-square and non-power-of-two dimension testing
+
+The assignment requires testing non-square and non-power-of-two matrix
+dimensions. Since kernels 3 onward assume `M`, `N`, `K` are exact multiples
+of the tile sizes (`BM`, `BN`, `BK`) with no boundary-check code, arbitrary
+shapes were tested via **zero-padding**: pad `A` and `B` up to the next tile
+multiple, run the kernel unmodified, then extract the real `M×N` region of
+the result. Correctness was verified independently against `torch.matmul`
+(not against our own prior kernel outputs), computed via a separate Python
+reference script, for full confidence the padding approach itself introduces
+no error.
+
+**Test kernel:** kernel 6 (vectorized, strided-load, bug-fixed), default
+`BM=BN=128, BK=16, TM=TN=8` (best autotuned config).
+
+| Shape           | Padded shape     | Blocks (of 142 SMs) | GFLOPS   | Max abs error vs torch |
+|-----------------|------------------|----------------------|----------|--------------------------|
+| 3000×1500×2048  | 3072×1536×2048   | 288 (2.03x)          | 27515.57 | 1.7e-3                   |
+| 8192×256×1024   | 8192×256×1024    | 128 (0.90x)          | 34083.58 | 5.8e-4                   |
+| 2048×2048×2049  | 2048×2048×2064   | 256 (1.80x)          | 35932.00 | 1.6e-3                   |
+| 137×263×401     | 256×384×416      | **6 (0.04x)**        | **623.98** | 1.6e-4                 |
+
+All four shapes pass correctness against an independent `torch.matmul`
+ground truth, with float32 accumulation error in the expected 1e-3 to 1e-4
+range for K on the order of hundreds to a couple thousand.
+
+**Key finding: small-matrix collapse is an occupancy problem, not a padding
+problem.** The `137×263×401` case is ~58x slower than the well-aligned large
+cases, but its padding-induced extra work is only ~3.4x (256×384×416 vs
+137×263×401 elements) — padding overhead alone cannot explain the gap. The
+real cause is grid size: this shape produces only **6 total thread blocks**,
+meaning at most 6 of the L40S's 142 SMs ever receive any work; the other 136
+sit completely idle for the kernel's entire (very short) runtime. This is
+the same underlying mechanism as the kernel 5 tile-size/SM-occupancy cliff
+found earlier, but far more extreme — 6 blocks vs 142 SMs is a ~24x
+under-subscription, compared to the ~2.2x under-subscription (64 blocks vs
+142 SMs) that caused kernel 5's more modest regression at 1024³.
+
+**Aspect ratio alone does not predict performance well.** `8192×256×1024`
+(extreme 32:1 aspect ratio, only 128 blocks — slightly *under* the 142-SM
+count) performs comparably to `2048×2048×2049` (square-ish, 256 blocks —
+comfortably *over* the SM count), both in the 34-36 TFLOPS range. This
+suggests that once each block has enough K-dimension work to keep its
+assigned SM busy for a reasonable duration (K=1024 here), a block count even
+somewhat below the SM count is not immediately catastrophic — unlike the
+137×263×401 case where blocks are both scarce (6) and individually short
+(K=401, and a much smaller M/N tile fraction is real work vs padding).
+
+**Practical implication for the assignment's "special cases" question:** for
+genuinely small matrices (row/col counts much smaller than the tile size),
+a fundamentally different kernel strategy — smaller tiles, or batching
+multiple independent small GEMMs into one kernel launch to fill the grid —
+would be necessary to use the GPU efficiently. This is exactly the kind of
+shape-dependent kernel selection cuBLAS performs internally (as Boehm's
+kernel 9/10 discussion notes: cuBLAS ships hundreds of SGEMM kernel variants
+and dispatches by shape at runtime), and our data provides a concrete,
+independently-reproduced illustration of *why* that dispatch is necessary.
