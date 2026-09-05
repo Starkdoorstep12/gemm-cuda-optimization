@@ -184,3 +184,71 @@ if __name__ == "__main__":
     plot_autotuning()
     plot_cublas_comparison(rows)
     print("\nAll plots generated in plots/")
+
+
+# --- Plot 7: Non-square dimension results across architectures ---
+def plot_nonsquare_results():
+    shapes = ["3000×1500\n×2048", "8192×256\n×1024", "2048×2048\n×2049", "137×263\n×401"]
+    blocks = [288, 128, 256, 6]
+    l40s = [27515.57, 34083.58, 35932.00, 623.98]
+    a100 = [10613.21, 7083.78, 9881.91, 218.59]
+    rtx6000 = [30582.82, 38043.57, 42540.81, 625.24]
+
+    x = range(len(shapes))
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax.bar([i - width for i in x], l40s, width, label="L40S", color=GPU_COLORS["L40S"])
+    ax.bar(x, a100, width, label="A100", color=GPU_COLORS["A100"])
+    ax.bar([i + width for i in x], rtx6000, width, label="RTX 6000 Ada", color=GPU_COLORS["RTX6000Ada"])
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([f"{s}\n({b} blocks)" for s, b in zip(shapes, blocks)], fontsize=8)
+    ax.set_ylabel("GFLOPS")
+    ax.set_yscale('log')
+    ax.set_title("Non-Square / Non-Power-of-Two Dimension Sweep (by architecture)")
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig("plots/07_nonsquare_dimensions.png")
+    plt.close()
+    print("Saved 07_nonsquare_dimensions.png")
+
+
+# --- Plot 8: Real ncu hardware metrics (T4) ---
+def plot_hardware_metrics():
+    kernels = ["Naive", "Coalesced", "SharedMem", "1DBlocktiled", "Vectorized"]
+    sectors_per_req = [16.51, 2.50, 4.00, 4.00, 16.81]
+    l1_hit = [99.23, 94.93, 1.52, 2.94, 15.32]
+    l2_hit = [88.37, 85.42, 74.56, 74.75, 83.59]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    axes[0].bar(kernels, sectors_per_req, color="#457B9D")
+    axes[0].set_ylabel("Sectors per request")
+    axes[0].set_title("Global Load Coalescing Efficiency\n(lower = better)")
+    axes[0].tick_params(axis='x', rotation=30)
+    axes[0].grid(True, alpha=0.3, axis='y')
+
+    axes[1].plot(kernels, l1_hit, marker='o', color="#E63946", label="L1 hit rate")
+    axes[1].plot(kernels, l2_hit, marker='s', color="#2E86AB", label="L2 hit rate")
+    axes[1].set_ylabel("Hit rate (%)")
+    axes[1].set_title("Cache Hit Rates")
+    axes[1].legend()
+    axes[1].tick_params(axis='x', rotation=30)
+    axes[1].grid(True, alpha=0.3)
+
+    bank_conflicts = [0, 0, 0, 0, 4194304]
+    axes[2].bar(kernels, bank_conflicts, color="#06A77D")
+    axes[2].set_ylabel("Shared-mem bank conflicts (LD)")
+    axes[2].set_title("Bank Conflicts by Kernel")
+    axes[2].tick_params(axis='x', rotation=30)
+    axes[2].grid(True, alpha=0.3, axis='y')
+
+    fig.suptitle("Real Hardware Counter Data (Nsight Compute, Tesla T4)", y=1.02)
+    plt.tight_layout()
+    plt.savefig("plots/08_hardware_metrics_ncu.png", bbox_inches='tight')
+    plt.close()
+    print("Saved 08_hardware_metrics_ncu.png")
+
+
+plot_nonsquare_results()
+plot_hardware_metrics()
